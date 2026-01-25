@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 multi_tif_viewer2.py (v2) + 批量输出优化：
-1) 生成 .txt / .tif：若存在同名文件，直接覆盖（默认覆盖，这里显式保证）
+1) 生成 .txt / .tif：��存在同名文件，直接覆盖（默认覆盖，这里显式保证）
 2) 叠加 .tif：逐像素“饱和加法”，任意像素超过 65535 最终固定为 65535（不管超过多少）
 3) 保留“双输出”：
    - folder_pixel_sum_raw16.tif（真实叠加16bit，饱和）
    - folder_pixel_sum_overlay_vis.tif（可视化：画圆网格+文字 A1：count）
+
+已修改：
+- 圆网格显示现在基于原始图像坐标绘制：网格在图片上的位置固定为“原始像素位置 + offset_x/offset_y”。
+- 仅当修改偏移量（offset_x/offset_y）时，圆网格位置才会移动。改变窗口大小 / 缩放 / 平移 不会改变圆网格在图像上的实际位置（显示上会随缩放平移，但相对图像内容位置保持一致）。
 
 依赖：
 pip install numpy pillow scikit-image scipy tifffile
@@ -226,6 +230,7 @@ def draw_grid_and_text_on_sum_image(sum16: np.ndarray, circle_params: dict, sum_
     """
     在叠加图可视化（由 sum16 归一化到 8bit）上画圆网格，并在每个圆中心写 "A1：203"。
     输出 PIL RGB 图像。
+    这里 circle_params 中的 offset_x/offset_y 是以原始像素为单位的偏移量（与检测一致）。
     """
     from PIL import ImageDraw, ImageFont
 
@@ -357,6 +362,8 @@ class ImagePanel(Frame):
         self.show_circles_var = tk.BooleanVar(value=False)
         self.circle_rows_var = tk.IntVar(value=8)
         self.circle_cols_var = tk.IntVar(value=12)
+        # NOTE: offset_x/offset_y are interpreted as ORIGINAL IMAGE PIXELS.
+        # Changing window size / zoom will not change the grid's position relative to the image content.
         self.circle_offset_x = 0
         self.circle_offset_y = 0
 
@@ -377,6 +384,7 @@ class ImagePanel(Frame):
 
         # PIL display
         self.orig_pil = None
+        # orig_w / orig_h store original image size in pixels
         self.orig_w = 0
         self.orig_h = 0
 
@@ -560,6 +568,7 @@ class ImagePanel(Frame):
             cols = max(1, min(200, cols))
             self.circle_rows_var.set(rows)
             self.circle_cols_var.set(cols)
+            # store offsets as original-image pixels
             self.circle_offset_x = ox
             self.circle_offset_y = oy
             self.update_image_display()
@@ -719,10 +728,25 @@ class ImagePanel(Frame):
             base = img_disp.convert('RGBA')
             img_disp = Image.alpha_composite(base, ann)
 
+        # draw circle grid based on ORIGINAL image coordinates mapped to display coords
         if self.show_circles_var.get():
-            img_disp = self._draw_circles_on_image(img_disp, rows=self.circle_rows_var.get(), cols=self.circle_cols_var.get(), diameter_cm=0.9, offset_x=self.circle_offset_x, offset_y=self.circle_offset_y)
+            img_disp = self._draw_circles_on_image(
+                img_disp,
+                rows=self.circle_rows_var.get(),
+                cols=self.circle_cols_var.get(),
+                diameter_cm=0.9,
+                offset_x=self.circle_offset_x,
+                offset_y=self.circle_offset_y
+            )
         if self.show_rectgrid_var.get():
-            img_disp = self._draw_rect_grid_on_image(img_disp, rows=self.rect_rows_var.get(), cols=self.rect_cols_var.get(), cell_px=self.rect_cell_px, offset_x=self.rect_offset_x, offset_y=self.rect_offset_y)
+            img_disp = self._draw_rect_grid_on_image(
+                img_disp,
+                rows=self.rect_rows_var.get(),
+                cols=self.rect_cols_var.get(),
+                cell_px=self.rect_cell_px,
+                offset_x=self.rect_offset_x,
+                offset_y=self.rect_offset_y
+            )
 
         self.photo = ImageTk.PhotoImage(img_disp)
         self.canvas.delete('IMG')
@@ -738,6 +762,7 @@ class ImagePanel(Frame):
         invert = self.invert_var.get()
         arr_disp = window_level(self.img_arr, wl, ww, threshold, invert)
         self.orig_pil = Image.fromarray(arr_disp)
+        # orig_pil.size -> (width, height)
         self.orig_w, self.orig_h = self.orig_pil.size
 
         canvas_w = self.canvas.winfo_width()
@@ -757,30 +782,42 @@ class ImagePanel(Frame):
         self.redraw_image()
 
     def _draw_circles_on_image(self, pil_img, rows=8, cols=12, diameter_cm=0.9, offset_x=0, offset_y=0):
+        """
+        在 display 图像（已按 self.scale 缩放）上绘制圆网格，但计算基于原始图像坐标：
+        - offset_x / offset_y 为原始像素单位
+        - 仅在修改 offset_x/offset_y 或图像内容时网格相对于图像内容发生实际移动
+        - 窗口缩放/平移仅影响显示（位置按缩放量同步），但网格相对于图像像素位置不变
+        """
         from PIL import ImageDraw
         draw = ImageDraw.Draw(pil_img, 'RGBA')
         disp_w, disp_h = pil_img.size
+        # original diameter in pixels
         px_per_cm = 416.0 / 2.0
         diameter_px_raw = diameter_cm * px_per_cm
+
+        # compute original-image coordinates for grid origin (top-left of grid)
+        grid_w_orig = diameter_px_raw * cols
+        grid_h_orig = diameter_px_raw * rows
+        start_x_orig = (self.orig_w - grid_w_orig) / 2.0 + offset_x
+        start_y_orig = (self.orig_h - grid_h_orig) / 2.0 + offset_y
+
+        # map to display coordinates by scaling
         display_diameter = diameter_px_raw * self.scale
-        grid_w = display_diameter * cols
-        grid_h = display_diameter * rows
-        if grid_w > disp_w or grid_h > disp_h:
-            display_diameter = min(disp_w / cols, disp_h / rows)
-            grid_w = display_diameter * cols
-            grid_h = display_diameter * rows
+        # do not auto-resize to fit; preserve actual positions
         display_diameter = max(1.0, display_diameter)
+        start_x_disp = start_x_orig * self.scale
+        start_y_disp = start_y_orig * self.scale
+
         r = display_diameter / 2.0
-        start_x = (disp_w - grid_w) / 2.0 + offset_x
-        start_y = (disp_h - grid_h) / 2.0 + offset_y
         outline_width = max(1, min(4, int(round(display_diameter * 0.01))))
         outline_color = (200, 0, 0, 220)
         for ri in range(rows):
-            cy = start_y + (ri + 0.5) * display_diameter
+            cy = start_y_disp + (ri + 0.5) * display_diameter
             for ci in range(cols):
-                cx = start_x + (ci + 0.5) * display_diameter
+                cx = start_x_disp + (ci + 0.5) * display_diameter
                 left, top = cx - r, cy - r
                 right, bottom = cx + r, cy + r
+                # drawing on PIL image: skip if completely outside visible display image
                 if right <= 0 or bottom <= 0 or left >= disp_w or top >= disp_h:
                     continue
                 bbox = [int(round(v)) for v in (left, top, right, bottom)]
@@ -788,19 +825,27 @@ class ImagePanel(Frame):
         return pil_img
 
     def _draw_rect_grid_on_image(self, pil_img, rows=4, cols=6, cell_px=416, offset_x=0, offset_y=0):
+        """
+        矩形网格绘制也基于原始图像坐标：
+        - cell_px 为原始像素单位（默认 416）
+        - offset_x/offset_y 为原始像素单位
+        """
         from PIL import ImageDraw
         draw = ImageDraw.Draw(pil_img, 'RGBA')
         disp_w, disp_h = pil_img.size
+        # compute original grid dims and origin, then map to display coords
+        grid_w_orig = cell_px * cols
+        grid_h_orig = cell_px * rows
+        start_x_orig = (self.orig_w - grid_w_orig) / 2.0 + offset_x
+        start_y_orig = (self.orig_h - grid_h_orig) / 2.0 + offset_y
+
         display_cell = cell_px * self.scale
+        display_cell = max(1.0, display_cell)
         grid_w = display_cell * cols
         grid_h = display_cell * rows
-        if grid_w > disp_w or grid_h > disp_h:
-            display_cell = min(disp_w / cols, disp_h / rows)
-            grid_w = display_cell * cols
-            grid_h = display_cell * rows
-        display_cell = max(1.0, display_cell)
-        start_x = (disp_w - grid_w) / 2.0 + offset_x
-        start_y = (disp_h - grid_h) / 2.0 + offset_y
+        start_x = start_x_orig * self.scale
+        start_y = start_y_orig * self.scale
+
         line_color = (255, 200, 0, 200)
         line_width = max(1, int(round(display_cell * 0.01)))
         for c in range(cols + 1):
@@ -816,6 +861,9 @@ class ImagePanel(Frame):
         return pil_img
 
     def compute_circle_stats(self):
+        """
+        统计圆网格每格的像素值之和 — 使用原始图像坐标进行计算，结果不会因为窗口缩放/大小变化而改变。
+        """
         if self.orig_pil is None:
             messagebox.showinfo("统计结果", "尚未加载图像或无显示内容。"); return
         if not self.show_circles_var.get():
@@ -830,50 +878,41 @@ class ImagePanel(Frame):
 
         rows = max(1, int(self.circle_rows_var.get()))
         cols = max(1, int(self.circle_cols_var.get()))
-        offset_x_disp = int(self.circle_offset_x)
-        offset_y_disp = int(self.circle_offset_y)
+        offset_x = int(self.circle_offset_x)
+        offset_y = int(self.circle_offset_y)
 
         diameter_cm = 0.9
         px_per_cm = 416.0 / 2.0
         diameter_px_raw = diameter_cm * px_per_cm
-
-        disp_w = self.orig_w * self.scale
-        disp_h = self.orig_h * self.scale
-        display_diameter = diameter_px_raw * self.scale
-        grid_w = display_diameter * cols
-        grid_h = display_diameter * rows
-        if grid_w > disp_w or grid_h > disp_h:
-            display_diameter = min(disp_w / cols, disp_h / rows)
-            grid_w = display_diameter * cols
-            grid_h = display_diameter * rows
-
-        r_eff = (display_diameter / max(self.scale, 1e-9)) / 2.0
-        start_x_disp = (disp_w - grid_w) / 2.0 + offset_x_disp
-        start_y_disp = (disp_h - grid_h) / 2.0 + offset_y_disp
+        r_orig = diameter_px_raw / 2.0
 
         h, w = self.img_arr.shape if self.img_arr.ndim == 2 else self.img_arr.shape[:2]
+
+        grid_w_orig = diameter_px_raw * cols
+        grid_h_orig = diameter_px_raw * rows
+        start_x_orig = (w - grid_w_orig) / 2.0 + offset_x
+        start_y_orig = (h - grid_h_orig) / 2.0 + offset_y
+
         results = []
         for ri in range(rows):
             row_label = index_to_letters(ri)
             for ci in range(cols):
                 col_label = str(ci + 1)
                 label = f"{row_label}{col_label}"
-                cy_disp = start_y_disp + (ri + 0.5) * display_diameter
-                cx_disp = start_x_disp + (ci + 0.5) * display_diameter
-                cy_orig = cy_disp / max(self.scale, 1e-9)
-                cx_orig = cx_disp / max(self.scale, 1e-9)
+                cy_orig = start_y_orig + (ri + 0.5) * diameter_px_raw
+                cx_orig = start_x_orig + (ci + 0.5) * diameter_px_raw
 
-                y0 = max(0, int(np.floor(cy_orig - r_eff)))
-                y1 = min(h, int(np.ceil(cy_orig + r_eff)) + 1)
-                x0 = max(0, int(np.floor(cx_orig - r_eff)))
-                x1 = min(w, int(np.ceil(cx_orig + r_eff)) + 1)
+                y0 = max(0, int(np.floor(cy_orig - r_orig)))
+                y1 = min(h, int(np.ceil(cy_orig + r_orig)) + 1)
+                x0 = max(0, int(np.floor(cx_orig - r_orig)))
+                x1 = min(w, int(np.ceil(cx_orig + r_orig)) + 1)
                 if y0 >= y1 or x0 >= x1:
                     results.append((label, 0.0))
                     continue
 
                 yy = np.arange(y0, y1).reshape(-1, 1)
                 xx = np.arange(x0, x1).reshape(1, -1)
-                mask = (yy - cy_orig) ** 2 + (xx - cx_orig) ** 2 <= (r_eff * r_eff)
+                mask = (yy - cy_orig) ** 2 + (xx - cx_orig) ** 2 <= (r_orig * r_orig)
 
                 sub = self.img_arr[y0:y1, x0:x1]
                 if stats_upper is not None:
@@ -1157,9 +1196,6 @@ class ImagePanel(Frame):
 
         self.update_image_display()
         self._show_detection_results()
-
-    # （v2原代码里这里还有一组 wrapper/impl/重复 _assign_colors_greedy；为简化维护，本版本不再重复定义）
-    # 单一实现即可正常工作。
 
     def save_annotated_image(self):
         if self.annotated_overlay is None and not self.detected_regions:
@@ -1675,7 +1711,7 @@ class MultiTifViewer(tk.Tk):
             prog.set_progress(len(tif_files) + 1, "生成逐像素叠加图（饱和到65535）...")
             sum16 = build_folder_pixel_sum_saturated_uint16(tif_files)
 
-            prog.set_progress(len(tif_files) + 1, "生成可视化叠加图（圆网格+文字）...")
+            prog.set_progress(len(tif_files) + 1, "生成可视化���加图（圆网格+文字）...")
             overlay_rgb = draw_grid_and_text_on_sum_image(sum16, circle_params, sum_counts)
 
             prog.set_progress(len(tif_files) + 2, "保存叠加图（raw16 + overlay_vis，覆盖同名文件）...")
