@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-multi_tif_viewer2.py (v2) + 批量输出优化：
-1) 生成 .txt / .tif：��存在同名文件，直接覆盖（默认覆盖，这里显式保证）
-2) 叠加 .tif：逐像素“饱和加法”，任意像素超过 65535 最终固定为 65535（不管超过多少）
-3) 保留“双输出”：
-   - folder_pixel_sum_raw16.tif（真实叠加16bit，饱和）
-   - folder_pixel_sum_overlay_vis.tif（可视化：画圆网格+文字 A1：count）
-
-已修改：
-- 圆网格显示现在基于原始图像坐标绘制：网格在图片上的位置固定为“原始像素位置 + offset_x/offset_y”。
-- 仅当修改偏移量（offset_x/offset_y）时，圆网格位置才会移动。改变窗口大小 / 缩放 / 平移 不会改变圆网格在图像上的实际位置（显示上会随缩放平移，但相对图像内容位置保持一致）。
-
+multi_tif_viewer2.py (v2) + 批量输出优化 + 方形网格支持 + 网格灰度和显示
+新增功能：
+- 可以选择网格形状：圆网格（原有）或正方形网格（边长 = 圆网格直径）
+- 当选择显示正方形网格后，所有基于“圆网格内”的检测/统计操作会改为“正方形网格内”进行
+- 增加“累加网格内灰度值并以每行一条的形式显示（方便复制）”的功能，显示形式为：
+    A1 100
+    A2 500
+    A3 200
+  并提供“复制到剪贴板”按钮
 依赖：
 pip install numpy pillow scikit-image scipy tifffile
 """
@@ -135,10 +133,12 @@ def save_per_image_counts_txt(img_path: str, circle_regions, total_count: int, d
     offset_x = int(circle_params["offset_x"])
     offset_y = int(circle_params["offset_y"])
     diameter_cm = float(circle_params.get("diameter_cm", 0.9))
+    grid_shape = circle_params.get("grid_shape", "circle")
 
     lines = []
     lines.append(f"image\t{os.path.basename(img_path)}")
     lines.append(f"total_spots\t{int(total_count)}")
+    lines.append(f"grid_shape\t{grid_shape}")
     lines.append(f"circle_grid\trows={rows}\tcols={cols}\toffset_x={offset_x}\toffset_y={offset_y}\tdiameter_cm={diameter_cm}")
     lines.append(
         "detection_params\tuse_otsu={}\tmin_pixels={}\tmax_pixels={}".format(
@@ -165,11 +165,13 @@ def save_folder_summary_txt(folder: str, tif_files: list, label_order: list, sum
     offset_x = int(circle_params["offset_x"])
     offset_y = int(circle_params["offset_y"])
     diameter_cm = float(circle_params.get("diameter_cm", 0.9))
+    grid_shape = circle_params.get("grid_shape", "circle")
 
     lines = []
     lines.append("summary_type\tcircle_spot_count_sum_across_images")
     lines.append(f"folder\t{folder}")
     lines.append(f"image_count\t{len(tif_files)}")
+    lines.append(f"grid_shape\t{grid_shape}")
     lines.append(f"circle_grid\trows={rows}\tcols={cols}\toffset_x={offset_x}\toffset_y={offset_y}\tdiameter_cm={diameter_cm}")
     lines.append(
         "detection_params\tuse_otsu={}\tmin_pixels={}\tmax_pixels={}".format(
@@ -228,9 +230,9 @@ def normalize_uint16_to_uint8(img16: np.ndarray) -> np.ndarray:
 
 def draw_grid_and_text_on_sum_image(sum16: np.ndarray, circle_params: dict, sum_counts: dict) -> Image.Image:
     """
-    在叠加图可视化（由 sum16 归一化到 8bit）上画圆网格，并在每个圆中心写 "A1：203"。
+    在叠加图可视化上画网格（圆或方），并在每个格中心写 "A1：203"。
     输出 PIL RGB 图像。
-    这里 circle_params 中的 offset_x/offset_y 是以原始像素为单位的偏移量（与检测一致）。
+    circle_params 中包含 grid_shape='circle' 或 'square'
     """
     from PIL import ImageDraw, ImageFont
 
@@ -245,6 +247,7 @@ def draw_grid_and_text_on_sum_image(sum16: np.ndarray, circle_params: dict, sum_
     offset_y = int(circle_params["offset_y"])
     diameter_px_raw = float(circle_params["diameter_px_raw"])
     r = diameter_px_raw / 2.0
+    grid_shape = circle_params.get("grid_shape", "circle")
 
     grid_w = diameter_px_raw * cols
     grid_h = diameter_px_raw * rows
@@ -263,6 +266,7 @@ def draw_grid_and_text_on_sum_image(sum16: np.ndarray, circle_params: dict, sum_
                 font = ImageFont.load_default()
 
     circle_outline = (255, 0, 0)
+    rect_outline = (255, 128, 0)
     text_fill = (255, 255, 0)
     text_stroke = (0, 0, 0)
 
@@ -277,7 +281,11 @@ def draw_grid_and_text_on_sum_image(sum16: np.ndarray, circle_params: dict, sum_
             if right <= 0 or bottom <= 0 or left >= w or top >= h:
                 continue
 
-            draw.ellipse([left, top, right, bottom], outline=circle_outline, width=2)
+            if grid_shape == 'circle':
+                draw.ellipse([left, top, right, bottom], outline=circle_outline, width=2)
+            else:
+                # square: draw rectangle with same side as diameter
+                draw.rectangle([left, top, right, bottom], outline=rect_outline, width=2)
 
             cnt = int(sum_counts.get(label, 0))
             text = f"{label}：{cnt}"
@@ -329,7 +337,7 @@ class SimpleRegion:
 
 
 # ============================================================
-# ImagePanel (v2：按圆检测 + 着色overlay)
+# ImagePanel (v2：按网格检测 + 着色overlay)
 # ============================================================
 class ImagePanel(Frame):
     def __init__(self, master, img_arr, img_name, remove_callback, img_path=None, select_callback=None):
@@ -359,7 +367,9 @@ class ImagePanel(Frame):
         self.threshold_var = tk.IntVar(value=int(img_arr.max()))
 
         # grid / misc
-        self.show_circles_var = tk.BooleanVar(value=False)
+        # show_grid_var: whether to show either circle or square grid (depending on grid_shape_var)
+        self.show_grid_var = tk.BooleanVar(value=False)
+        self.grid_shape_var = tk.StringVar(value='circle')  # 'circle' or 'square'
         self.circle_rows_var = tk.IntVar(value=8)
         self.circle_cols_var = tk.IntVar(value=12)
         # NOTE: offset_x/offset_y are interpreted as ORIGINAL IMAGE PIXELS.
@@ -379,7 +389,7 @@ class ImagePanel(Frame):
         self.annotated_overlay = None
         self.show_big_spots_var = tk.BooleanVar(value=True)
 
-        # regions per circle
+        # regions per grid cell
         self.circle_regions = []
 
         # PIL display
@@ -464,8 +474,14 @@ class ImagePanel(Frame):
 
         # circle/grid controls
         circle_frame = Frame(self.function_area)
-        self.circle_check = tk.Checkbutton(circle_frame, text="显示 圆网格 (φ=0.9cm)", variable=self.show_circles_var, command=self.update_image_display)
-        self.circle_check.grid(row=0, column=0, columnspan=12, sticky='w')
+        # show grid checkbox (circle or square depends on grid_shape_var)
+        self.circle_check = tk.Checkbutton(circle_frame, text="显示 网格 (圆/方) (φ=0.9cm)", variable=self.show_grid_var, command=self.update_image_display)
+        self.circle_check.grid(row=0, column=0, columnspan=6, sticky='w')
+
+        # grid shape radio buttons
+        Label(circle_frame, text="网格形状:").grid(row=0, column=6, sticky='e')
+        tk.Radiobutton(circle_frame, text='圆', variable=self.grid_shape_var, value='circle', command=self.update_image_display).grid(row=0, column=7, sticky='w')
+        tk.Radiobutton(circle_frame, text='方', variable=self.grid_shape_var, value='square', command=self.update_image_display).grid(row=0, column=8, sticky='w')
 
         Label(circle_frame, text="行数:").grid(row=1, column=0, sticky='e')
         self.circle_rows_entry = Entry(circle_frame, width=5)
@@ -493,8 +509,10 @@ class ImagePanel(Frame):
         self.stats_upper_entry.grid(row=1, column=9, sticky='w', padx=(2, 6))
 
         Label(circle_frame, text=" 的像素").grid(row=1, column=10, sticky='w')
-        Button(circle_frame, text="应用圆网格参数", command=self.apply_circle_params).grid(row=1, column=11, padx=6)
-        Button(circle_frame, text="统计圆网格总计数", command=self.compute_circle_stats).grid(row=1, column=12, padx=6)
+        Button(circle_frame, text="应用网格参数", command=self.apply_circle_params).grid(row=1, column=11, padx=6)
+        Button(circle_frame, text="统计网格总计数", command=self.compute_circle_stats).grid(row=1, column=12, padx=6)
+        # 新增：统计网格灰度和（每行一条，便于复制）
+        Button(circle_frame, text="统计网格灰度和（每行一条）", command=self.compute_grid_pixel_sum_lines).grid(row=1, column=13, padx=6)
         circle_frame.pack(fill=tk.X, pady=2)
 
         # rect grid
@@ -728,15 +746,16 @@ class ImagePanel(Frame):
             base = img_disp.convert('RGBA')
             img_disp = Image.alpha_composite(base, ann)
 
-        # draw circle grid based on ORIGINAL image coordinates mapped to display coords
-        if self.show_circles_var.get():
-            img_disp = self._draw_circles_on_image(
+        # draw grid (circle or square) based on ORIGINAL image coordinates mapped to display coords
+        if self.show_grid_var.get():
+            img_disp = self._draw_grid_on_image(
                 img_disp,
                 rows=self.circle_rows_var.get(),
                 cols=self.circle_cols_var.get(),
                 diameter_cm=0.9,
                 offset_x=self.circle_offset_x,
-                offset_y=self.circle_offset_y
+                offset_y=self.circle_offset_y,
+                grid_shape=self.grid_shape_var.get()
             )
         if self.show_rectgrid_var.get():
             img_disp = self._draw_rect_grid_on_image(
@@ -781,9 +800,9 @@ class ImagePanel(Frame):
 
         self.redraw_image()
 
-    def _draw_circles_on_image(self, pil_img, rows=8, cols=12, diameter_cm=0.9, offset_x=0, offset_y=0):
+    def _draw_grid_on_image(self, pil_img, rows=8, cols=12, diameter_cm=0.9, offset_x=0, offset_y=0, grid_shape='circle'):
         """
-        在 display 图像（已按 self.scale 缩放）上绘制圆网格，但计算基于原始图像坐标：
+        在 display 图像（已按 self.scale 缩放）上绘制网格（圆或方），计算基于原始图像坐标：
         - offset_x / offset_y 为原始像素单位
         - 仅在修改 offset_x/offset_y 或图像内容时网格相对于图像内容发生实际移动
         - 窗口缩放/平移仅影响显示（位置按缩放量同步），但网格相对于图像像素位置不变
@@ -810,7 +829,8 @@ class ImagePanel(Frame):
 
         r = display_diameter / 2.0
         outline_width = max(1, min(4, int(round(display_diameter * 0.01))))
-        outline_color = (200, 0, 0, 220)
+        outline_color_circle = (200, 0, 0, 220)
+        outline_color_square = (200, 120, 0, 220)
         for ri in range(rows):
             cy = start_y_disp + (ri + 0.5) * display_diameter
             for ci in range(cols):
@@ -821,7 +841,10 @@ class ImagePanel(Frame):
                 if right <= 0 or bottom <= 0 or left >= disp_w or top >= disp_h:
                     continue
                 bbox = [int(round(v)) for v in (left, top, right, bottom)]
-                draw.ellipse(bbox, outline=outline_color, width=outline_width)
+                if grid_shape == 'circle':
+                    draw.ellipse(bbox, outline=outline_color_circle, width=outline_width)
+                else:
+                    draw.rectangle(bbox, outline=outline_color_square, width=outline_width)
         return pil_img
 
     def _draw_rect_grid_on_image(self, pil_img, rows=4, cols=6, cell_px=416, offset_x=0, offset_y=0):
@@ -862,12 +885,13 @@ class ImagePanel(Frame):
 
     def compute_circle_stats(self):
         """
-        统计圆网格每格的像素值之和 — 使用原始图像坐标进行计算，结果不会因为窗口缩放/大小变化而改变。
+        统计网格（圆或方）每格的像素值之和 — 使用原始图像坐标进行计算，结果不会因为窗口缩放/大小变化而改变。
+        以表格形式显示默认（带标题）；如需仅每行一条便于复制，请使用“统计网格灰度和（每行一条）”按钮。
         """
         if self.orig_pil is None:
             messagebox.showinfo("统计结果", "尚未加载图像或无显示内容。"); return
-        if not self.show_circles_var.get():
-            messagebox.showinfo("统计结果", "圆网格未启用，请先勾选“显示 圆网格”。"); return
+        if not self.show_grid_var.get():
+            messagebox.showinfo("统计结果", "网格未启用，请先勾选“显示 网格 (圆/方)”。"); return
         stats_upper = None
         try:
             text = self.stats_upper_entry.get().strip()
@@ -893,6 +917,8 @@ class ImagePanel(Frame):
         start_x_orig = (w - grid_w_orig) / 2.0 + offset_x
         start_y_orig = (h - grid_h_orig) / 2.0 + offset_y
 
+        grid_shape = self.grid_shape_var.get()
+
         results = []
         for ri in range(rows):
             row_label = index_to_letters(ri)
@@ -912,21 +938,26 @@ class ImagePanel(Frame):
 
                 yy = np.arange(y0, y1).reshape(-1, 1)
                 xx = np.arange(x0, x1).reshape(1, -1)
-                mask = (yy - cy_orig) ** 2 + (xx - cx_orig) ** 2 <= (r_orig * r_orig)
+                if grid_shape == 'circle':
+                    mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= (r_orig * r_orig)
+                else:
+                    # square: full bounding box
+                    mask = np.ones((y1 - y0, x1 - x0), dtype=bool)
 
                 sub = self.img_arr[y0:y1, x0:x1]
                 if stats_upper is not None:
                     valid = sub <= stats_upper
                     mask = mask & valid
 
-                sum_values = float(np.sum(sub[mask], dtype=np.uint64))
+                # sum of grayscale intensities within mask
+                sum_values = int(np.sum(sub[mask], dtype=np.uint64))
                 results.append((label, sum_values))
 
         top = tk.Toplevel(self)
-        top.title("圆网格逐格“计数值之和”")
+        top.title("网格逐格灰度和（按格显示）")
         top.geometry("480x560")
         Label(top, text=f"图片：{self.img_name}", anchor='w').pack(fill=tk.X, padx=8, pady=(8, 2))
-        Label(top, text=f"网格：{rows} 行 × {cols} 列（行=A..，列=1..）", anchor='w').pack(fill=tk.X, padx=8)
+        Label(top, text=f"网格：{rows} 行 × {cols} 列（行=A..，列=1..），形状={self.grid_shape_var.get()}", anchor='w').pack(fill=tk.X, padx=8)
         if stats_upper is not None:
             Label(top, text=f"统计忽略阈值：大于 {stats_upper} 的像素不计入总和", anchor='w', fg="#444").pack(fill=tk.X, padx=8)
 
@@ -938,25 +969,124 @@ class ImagePanel(Frame):
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=txt.yview)
 
-        txt.insert(tk.END, "标签\t计数值之和\n")
-        txt.insert(tk.END, "----\t----------\n")
+        txt.insert(tk.END, "标签\t灰度和\n")
+        txt.insert(tk.END, "----\t------\n")
         for label, s in results:
-            txt.insert(tk.END, f"{label}\t{s:.2f}\n")
+            txt.insert(tk.END, f"{label}\t{s}\n")
         txt.config(state=tk.NORMAL)
 
         def copy_to_clipboard():
             try:
-                data = "标签\t计数值之和\n" + "\n".join([f"{l}\t{v:.2f}" for l, v in results])
+                data = "标签 灰度和\n" + "\n".join([f"{l} {v}" for l, v in results])
                 top.clipboard_clear()
                 top.clipboard_append(data)
-                messagebox.showinfo("复制成功", "已将结果复制到剪贴板。")
+                messagebox.showinfo("复制成功", "已将结果（含标题）复制到剪贴板。")
             except Exception as e:
                 messagebox.showerror("复制失败", f"错误：{e}")
 
         Button(top, text="复制结果到剪贴板", command=copy_to_clipboard).pack(pady=(0, 8))
 
+    def compute_grid_pixel_sum_lines(self):
+        """
+        将每个网格（圆或方）内的灰度和按一行一条的形式显示，便于复制：
+        输出示例：
+        A1 100
+        A2 500
+        A3 200
+        """
+        if self.orig_pil is None:
+            messagebox.showinfo("统计结果", "尚未加载图像或无显示内容。"); return
+        if not self.show_grid_var.get():
+            messagebox.showinfo("统计结果", "网格未启用，请先勾选“显示 网格 (圆/方)”。"); return
+        stats_upper = None
+        try:
+            text = self.stats_upper_entry.get().strip()
+            if text != "":
+                stats_upper = float(text)
+        except Exception:
+            stats_upper = None
+
+        rows = max(1, int(self.circle_rows_var.get()))
+        cols = max(1, int(self.circle_cols_var.get()))
+        offset_x = int(self.circle_offset_x)
+        offset_y = int(self.circle_offset_y)
+
+        diameter_cm = 0.9
+        px_per_cm = 416.0 / 2.0
+        diameter_px_raw = diameter_cm * px_per_cm
+        r_orig = diameter_px_raw / 2.0
+
+        h, w = self.img_arr.shape if self.img_arr.ndim == 2 else self.img_arr.shape[:2]
+
+        grid_w_orig = diameter_px_raw * cols
+        grid_h_orig = diameter_px_raw * rows
+        start_x_orig = (w - grid_w_orig) / 2.0 + offset_x
+        start_y_orig = (h - grid_h_orig) / 2.0 + offset_y
+
+        grid_shape = self.grid_shape_var.get()
+
+        lines = []
+        for ri in range(rows):
+            for ci in range(cols):
+                label = f"{index_to_letters(ri)}{ci+1}"
+                cy_orig = start_y_orig + (ri + 0.5) * diameter_px_raw
+                cx_orig = start_x_orig + (ci + 0.5) * diameter_px_raw
+
+                y0 = max(0, int(np.floor(cy_orig - r_orig)))
+                y1 = min(h, int(np.ceil(cy_orig + r_orig)) + 1)
+                x0 = max(0, int(np.floor(cx_orig - r_orig)))
+                x1 = min(w, int(np.ceil(cx_orig + r_orig)) + 1)
+                if y0 >= y1 or x0 >= x1:
+                    lines.append(f"{label} 0")
+                    continue
+
+                yy = np.arange(y0, y1).reshape(-1, 1)
+                xx = np.arange(x0, x1).reshape(1, -1)
+                if grid_shape == 'circle':
+                    mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= (r_orig * r_orig)
+                else:
+                    mask = np.ones((y1 - y0, x1 - x0), dtype=bool)
+
+                sub = self.img_arr[y0:y1, x0:x1]
+                if stats_upper is not None:
+                    valid = sub <= stats_upper
+                    mask = mask & valid
+
+                sum_values = int(np.sum(sub[mask], dtype=np.uint64))
+                lines.append(f"{label} {sum_values}")
+
+        top = tk.Toplevel(self)
+        top.title("网格灰度和（每行一条，便于复制）")
+        top.geometry("420x560")
+        Label(top, text=f"图片：{self.img_name}", anchor='w').pack(fill=tk.X, padx=8, pady=(8, 2))
+        Label(top, text=f"网格：{rows} 行 × {cols} 列，形状={self.grid_shape_var.get()}", anchor='w').pack(fill=tk.X, padx=8)
+        if stats_upper is not None:
+            Label(top, text=f"统计忽略阈值：大于 {stats_upper} 的像素不计入总和", anchor='w', fg="#444").pack(fill=tk.X, padx=8)
+
+        frm = Frame(top)
+        frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        scrollbar = tk.Scrollbar(frm)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        txt = tk.Text(frm, wrap=tk.NONE, yscrollcommand=scrollbar.set, font=("Consolas", 12))
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=txt.yview)
+
+        txt.insert(tk.END, "\n".join(lines))
+        txt.config(state=tk.NORMAL)
+
+        def copy_lines():
+            try:
+                data = "\n".join(lines)
+                top.clipboard_clear()
+                top.clipboard_append(data)
+                messagebox.showinfo("复制成功", "已将每行一条的结果复制到剪贴板。")
+            except Exception as e:
+                messagebox.showerror("复制失败", f"错误：{e}")
+
+        Button(top, text="复制每行一条到剪贴板", command=copy_lines).pack(pady=(0, 8))
+
     # -------------------------
-    # run_detection (v2：仅在圆内检测 + watershed 拆分)
+    # run_detection (v2：按网格内检测 + watershed 拆分)
     # -------------------------
     def run_detection(self):
         try:
@@ -977,6 +1107,8 @@ class ImagePanel(Frame):
 
         h, w = self.img_arr.shape if self.img_arr.ndim == 2 else self.img_arr.shape[:2]
         r_orig = diameter_px_raw / 2.0
+
+        grid_shape = self.grid_shape_var.get()
 
         all_detected_regions = []
         self.circle_regions = []
@@ -1006,7 +1138,11 @@ class ImagePanel(Frame):
                     continue
 
                 yy, xx = np.ogrid[y0:y1, x0:x1]
-                circle_mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= r_orig ** 2
+                if grid_shape == 'circle':
+                    circle_mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= r_orig ** 2
+                else:
+                    circle_mask = np.ones((y1 - y0, x1 - x0), dtype=bool)  # square bounding box
+
                 if not circle_mask.any():
                     self.circle_regions.append((label, []))
                     continue
@@ -1225,7 +1361,7 @@ class ImagePanel(Frame):
 
     def _show_detection_results(self):
         top = tk.Toplevel(self)
-        top.title("检测结果：每个圆网格内大亮点总个数")
+        top.title("检测结果：每个网格内大亮点总个数")
         top.geometry("600x600")
         Label(top, text=f"图片：{self.img_name}", anchor='w').pack(fill=tk.X, padx=8, pady=(8, 2))
         Label(top, text=f"总检测到目标数量：{len(self.detected_regions)}", anchor='w').pack(fill=tk.X, padx=8)
@@ -1238,7 +1374,7 @@ class ImagePanel(Frame):
         txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=txt.yview)
 
-        txt.insert(tk.END, "圆网格\t亮点总个数\n")
+        txt.insert(tk.END, "网格\t亮点总个数\n")
         txt.insert(tk.END, "------\t------------\n")
         for label, regions in self.circle_regions:
             txt.insert(tk.END, f"{label}\t{len(regions)}\n")
@@ -1246,7 +1382,7 @@ class ImagePanel(Frame):
 
         def copy_cb():
             try:
-                lines = ["圆网格\t亮点总个数"]
+                lines = ["网格\t亮点总个数"]
                 for label, regions in self.circle_regions:
                     lines.append(f"{label}\t{len(regions)}")
                 top.clipboard_clear()
@@ -1400,6 +1536,7 @@ class MultiTifViewer(tk.Tk):
         批量检测（完整实现）：
         - .txt/.tif 同名直接覆盖
         - 叠加像素饱和到 65535
+        - 支持网格形状：circle / square（由当前选中图片的参数决定）
         """
         if self.selected_panel is None:
             messagebox.showinfo("批量检测", "请先打开至少一张图片，并单击选中一张图片作为参数来源。")
@@ -1430,8 +1567,9 @@ class MultiTifViewer(tk.Tk):
             cols = int(src.circle_cols_var.get())
             offset_x = int(src.circle_offset_x)
             offset_y = int(src.circle_offset_y)
+            grid_shape = src.grid_shape_var.get()
         except Exception as e:
-            messagebox.showerror("参数错误", f"请检查圆网格参数输入：{e}")
+            messagebox.showerror("参数错误", f"请检查网格参数输入：{e}")
             return
 
         diameter_cm = 0.9
@@ -1445,6 +1583,7 @@ class MultiTifViewer(tk.Tk):
             "offset_y": offset_y,
             "diameter_cm": diameter_cm,
             "diameter_px_raw": diameter_px_raw,
+            "grid_shape": grid_shape,
         }
 
         label_order = circle_label_order(rows, cols)
@@ -1463,7 +1602,7 @@ class MultiTifViewer(tk.Tk):
         vis_path = ""
 
         # ============================================================
-        # 逐图检测（per-circle 检测）
+        # 逐图检测（per-grid 检测）
         # ============================================================
         for i, path in enumerate(tif_files, start=1):
             prog.set_progress(i, f"检测：{os.path.basename(path)}")
@@ -1503,7 +1642,11 @@ class MultiTifViewer(tk.Tk):
                             continue
 
                         yy, xx = np.ogrid[y0:y1, x0:x1]
-                        circle_mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= r_orig ** 2
+                        if grid_shape == 'circle':
+                            circle_mask = (xx - cx_orig) ** 2 + (yy - cy_orig) ** 2 <= r_orig ** 2
+                        else:
+                            circle_mask = np.ones((y1 - y0, x1 - x0), dtype=bool)
+
                         if not circle_mask.any():
                             circle_regions.append((lab, []))
                             continue
@@ -1711,7 +1854,7 @@ class MultiTifViewer(tk.Tk):
             prog.set_progress(len(tif_files) + 1, "生成逐像素叠加图（饱和到65535）...")
             sum16 = build_folder_pixel_sum_saturated_uint16(tif_files)
 
-            prog.set_progress(len(tif_files) + 1, "生成可视化���加图（圆网格+文字）...")
+            prog.set_progress(len(tif_files) + 1, "生成可视化叠加图（网格+文字）...")
             overlay_rgb = draw_grid_and_text_on_sum_image(sum16, circle_params, sum_counts)
 
             prog.set_progress(len(tif_files) + 2, "保存叠加图（raw16 + overlay_vis，覆盖同名文件）...")
@@ -1737,7 +1880,7 @@ class MultiTifViewer(tk.Tk):
             "1) 每张图片同名 .txt（覆盖同名文件）",
             "2) folder_big_spot_summary.txt（覆盖同名文件）",
             "3) folder_pixel_sum_raw16.tif（叠加饱和到65535，覆盖同名文件）",
-            "4) folder_pixel_sum_overlay_vis.tif（可视化：圆网格+文字，覆盖同名文件）",
+            "4) folder_pixel_sum_overlay_vis.tif（可视化：网格+文字，覆盖同名文件）",
         ]
         if summary_txt_path:
             msg.append(f"汇总TXT：{summary_txt_path}")
