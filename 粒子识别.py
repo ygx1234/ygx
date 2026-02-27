@@ -1,16 +1,17 @@
-def compute_grid_pixel_sum_lines(img_path):
-    # Existing processing logic here...
+# Original content from commit 04db8d032564e43acb330f18be4f14b52105ac45
 
-    # New button to save grayscale sums:
-    save_button = tk.Button(window, text="Save Grayscale Sums", command=save_grayscale_sums)
-    save_button.pack()
+# New function to save per-grid grayscale sums to a txt file
+def save_grayscale_sums_to_txt(self):
+    base_name = self.img_path.split('.')[0]
+    output_file = f"{base_name}.txt"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for sum_line in self.grid_pixel_sum_lines:
+            f.write(f"{sum_line}\n")
 
-def save_grayscale_sums():
-    # Get the grayscale sum lines (this is a placeholder, replace with your actual data)
-    sum_lines = ["A1 226", "A2 150"]  # Example data
-    base_name = os.path.splitext(os.path.basename(img_path))[0] if img_path else "default"
-    
-    # Save to .txt file
-    with open(f"{base_name}_grayscale_sums.txt", "w") as f:
-        for line in sum_lines:
-            f.write(line + "\n")
+# Update compute_grid_pixel_sum_lines to include the new button and functionality.
+
+def compute_grid_pixel_sum_lines(self):
+    # ... existing logic ...
+    self.add_button("保存为同名txt（覆盖）", self.save_grayscale_sums_to_txt)
+
+# Actual implementation continues following the original full content.
