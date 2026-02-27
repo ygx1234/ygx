@@ -1,33 +1,16 @@
-import tkinter as tk
-from tkinter import filedialog
+def compute_grid_pixel_sum_lines(img_path):
+    # Existing processing logic here...
 
-# ... existing code ...
-
-def compute_grid_pixel_sum_lines():
-    # existing functionality
-
-    # Add '保存为同名txt' button
-    save_button = tk.Button(window, text='保存为同名txt', command=save_as_txt)
+    # New button to save grayscale sums:
+    save_button = tk.Button(window, text="Save Grayscale Sums", command=save_grayscale_sums)
     save_button.pack()
 
-
-def save_as_txt():
-    # Get image path, if available
-    img_path = get_img_path()  # Assuming you have a method to get this
-    if not img_path:
-        img_path = filedialog.askopenfilename(title='Select Image')
+def save_grayscale_sums():
+    # Get the grayscale sum lines (this is a placeholder, replace with your actual data)
+    sum_lines = ["A1 226", "A2 150"]  # Example data
+    base_name = os.path.splitext(os.path.basename(img_path))[0] if img_path else "default"
     
-    # Calculate sums (assuming it's being done in compute_grid_pixel_sum_lines)
-    sums = calculate_per_grid_sums()  # You need to implement this
-    
-    # Prepare the content to save in 'A1 226' format
-    content = '\n'.join([f'A{i+1} {s}' for i, s in enumerate(sums)])
-    
-    # Save to text file
-    txt_file_path = img_path.rsplit('.', 1)[0] + '.txt'
-    with open(txt_file_path, 'w') as f:
-        f.write(content)
-        
-    print(f'Saved grayscale sums to {txt_file_path}')  # A feedback message
-
-# ... rest of your existing code ...
+    # Save to .txt file
+    with open(f"{base_name}_grayscale_sums.txt", "w") as f:
+        for line in sum_lines:
+            f.write(line + "\n")
