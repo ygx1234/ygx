@@ -354,8 +354,8 @@ class ImagePanel(Frame):
         # show_grid_var: whether to show either circle or square grid (depending on grid_shape_var)
         self.show_grid_var = tk.BooleanVar(value=False)
         self.grid_shape_var = tk.StringVar(value='circle')  # 'circle' or 'square'
-        self.circle_rows_var = tk.IntVar(value=8)
-        self.circle_cols_var = tk.IntVar(value=12)
+        self.circle_rows_var = tk.IntVar(value=1)
+        self.circle_cols_var = tk.IntVar(value=1)
         # NOTE: offset_x/offset_y are interpreted as ORIGINAL IMAGE PIXELS.
         # Changing window size / zoom will not change the grid's position relative to the image content.
         self.circle_offset_x = 0
